@@ -81,8 +81,8 @@ final class CameraPipeline {
         Camera.requestAccess { [self] granted in
             guard granted else {
                 fail("""
-                Camera access is off. Turn it on for your terminal app in
-                System Settings → Privacy & Security → Camera, then run this again.
+                Camera access is off. Turn it on for \(permissionHolder) in
+                System Settings → Privacy & Security → Camera, then start gaze-switch again.
                 """)
             }
             guard let device = Camera.pick(named: cameraName) else {

@@ -1,20 +1,15 @@
 import AppKit
 import GazeSwitchCore
 
-/// Loads the saved calibration and warns about anything that would make it inaccurate.
-func loadModel(required: Bool) -> GazeModel? {
-    let model: GazeModel?
-    do { model = try Storage.loadCalibration() } catch {
-        fail("Couldn't read \(Storage.calibrationURL.path): \(error)\nRun 'gaze-switch calibrate' to make a new one.")
-    }
-    guard let model, model.isCompatible else {
-        if required { fail("Not calibrated yet. Run 'gaze-switch calibrate' first.") }
+/// The saved calibration, if there is one made with the current feature set.
+func loadModel() -> GazeModel? {
+    do {
+        guard let model = try Storage.loadCalibration(), model.isCompatible else { return nil }
+        return model
+    } catch {
+        print("Couldn't read \(Storage.calibrationURL.path): \(error)")
         return nil
     }
-    if !Displays.match(model.displays) {
-        print("Warning: your screens have changed since calibration. Run 'gaze-switch calibrate' again.")
-    }
-    return model
 }
 
 func describe(_ p: GazeModel.Prediction?, model: GazeModel, windows: [WindowInfo]) -> String {
@@ -22,6 +17,29 @@ func describe(_ p: GazeModel.Prediction?, model: GazeModel, windows: [WindowInfo
     let display = model.displays.first { $0.id == p.displayID }?.name ?? "?"
     let window = topWindow(at: p.point, in: windows)?.label ?? "desktop"
     return "→ \(display) · \(window)"
+}
+
+enum CalibrationOutcome {
+    case cancelled
+    case failed
+    case saved(GazeModel, summary: String)
+}
+
+/// Saves a finished calibration and describes how accurate it is.
+func finishCalibration(_ model: GazeModel?, skipped: Int) -> CalibrationOutcome {
+    guard skipped >= 0 else { return .cancelled }
+    guard let model else { return .failed }
+    do { try Storage.saveCalibration(model) } catch { fail("Couldn't save calibration: \(error)") }
+    var lines: [String] = []
+    if skipped > 0 { lines.append("\(skipped) dot\(skipped == 1 ? " was" : "s were") skipped because your face wasn't visible.") }
+    for a in model.accuracy() {
+        let name = model.displays.first { $0.id == a.displayID }?.name ?? "?"
+        lines.append(String(format: "%@: right screen %.0f%% of the time, off by about %.0f%% across and %.0f%% up/down.",
+                            name, a.displayHitRate * 100, a.horizontalError * 100, a.verticalError * 100))
+        // Side-by-side halves are a quarter of the screen's width away from the split line.
+        if a.horizontalError > 0.15 { lines.append("That's too loose to tell split-screen windows apart; try calibrating again.") }
+    }
+    return .saved(model, summary: lines.joined(separator: "\n"))
 }
 
 /// Step 1: shows live what the camera sees and, once calibrated, where you're looking.
@@ -36,11 +54,14 @@ final class TrackCommand {
 
     init(config: Config, showGaze: Bool) {
         self.config = config
-        model = loadModel(required: false)
+        model = loadModel()
         overlay = showGaze && model != nil ? GazeOverlay() : nil
     }
 
     func start() {
+        if let model, !Displays.match(model.displays) {
+            print("Warning: your screens have changed since calibration. Run 'gaze-switch calibrate' again.")
+        }
         if model == nil { print("Not calibrated yet, so this shows raw head and eye readings. Turn your head and watch them change.") }
         print("Press Ctrl-C to stop.")
         pipeline.start(cameraName: config.camera) { [weak self] in self?.handle($0) }
@@ -81,45 +102,79 @@ final class CalibrateCommand {
         let displays = Displays.current()
         print("Calibrating \(displays.count) screen\(displays.count == 1 ? "" : "s"): \(displays.map(\.name).joined(separator: ", "))")
         let controller = CalibrationController(displays: displays) { model, skipped in
-            Self.finish(model: model, skipped: skipped)
+            switch finishCalibration(model, skipped: skipped) {
+            case .cancelled:
+                fail("Calibration cancelled.")
+            case .failed:
+                fail("Not enough data to calibrate. Check that the camera can see your face and try again.")
+            case .saved(_, let summary):
+                print("Saved to \(Storage.calibrationURL.path)")
+                print(summary)
+                print("Try it with 'gaze-switch track --show-gaze', then 'gaze-switch run'.")
+                exit(0)
+            }
         }
         self.controller = controller
         pipeline.start(cameraName: config.camera) { [weak controller] in controller?.handle($0) }
         controller.start()
     }
+}
 
-    private static func finish(model: GazeModel?, skipped: Int) {
-        guard skipped >= 0 else { fail("Calibration cancelled.") }
-        guard let model else { fail("Not enough data to calibrate. Check that the camera can see your face and try again.") }
-        do { try Storage.saveCalibration(model) } catch { fail("Couldn't save calibration: \(error)") }
-        print("Saved to \(Storage.calibrationURL.path)")
-        if skipped > 0 { print("\(skipped) dot\(skipped == 1 ? " was" : "s were") skipped because your face wasn't visible.") }
-        for a in model.accuracy() {
-            let name = model.displays.first { $0.id == a.displayID }?.name ?? "?"
-            print(String(format: "  %@: right screen %.0f%% of the time, off by about %.0f%% across and %.0f%% up/down",
-                         name, a.displayHitRate * 100, a.horizontalError * 100, a.verticalError * 100))
-            // Side-by-side halves are a quarter of the screen's width away from the split line.
-            if a.horizontalError > 0.15 { print("    That's too loose to tell split-screen windows apart; try calibrating again.") }
+/// Steps 3–6 from the command line.
+final class RunCommand {
+    private let config: Config
+    private let switcher: Switcher
+    private let pipeline: CameraPipeline
+
+    init(config: Config, showGaze: Bool, verbose: Bool) {
+        guard let model = loadModel() else { fail("Not calibrated yet. Run 'gaze-switch calibrate' first.") }
+        if !Displays.match(model.displays) {
+            print("Warning: your screens have changed since calibration. Run 'gaze-switch calibrate' again.")
         }
-        print("Try it with 'gaze-switch track --show-gaze', then 'gaze-switch run'.")
-        exit(0)
+        self.config = config
+        switcher = Switcher(config: config, model: model, showGaze: showGaze, verbose: verbose)
+        pipeline = CameraPipeline(tracksHands: config.scrollMode.usesHands || config.gestureToggle)
+    }
+
+    func start() {
+        Permissions.waitForAccessibility { [self] in
+            if let problem = switcher.registerHotkey() { print(problem) }
+            var toggles = ["\(config.hotkey) to turn on/off"]
+            if config.gestureToggle { toggles.append("hold up an open palm") }
+            print("gaze-switch is \(switcher.enabled ? "on" : "off"). \(toggles.joined(separator: ", or ")). Scrolling: \(config.scrollMode.rawValue).")
+            if config.scrollMode.usesHands { print("Pinch your thumb and index finger, then move your hand up or down to scroll.") }
+            if config.scrollMode.usesEyes { print("Look near the top or bottom edge of a window to scroll it.") }
+            print("Press Ctrl-C to quit.")
+            pipeline.start(cameraName: config.camera) { [weak self] in self?.switcher.handle($0) }
+        }
+    }
+
+    func stop() {
+        switcher.stop()
     }
 }
 
-/// Steps 3–6: activates the window you look at and scrolls it with hand gestures or your eyes.
-final class RunCommand {
+/// Activates the window you look at and scrolls it with hand gestures or your eyes.
+final class Switcher {
     private enum ScrollSource { case none, hands, eyes }
+
+    var onToggle: ((Bool) -> Void)?
+    private(set) var enabled: Bool
+    var showGaze: Bool {
+        didSet { if !showGaze { overlay?.show(at: nil, color: .clear) } }
+    }
+    var scrollMode: ScrollMode {
+        didSet { endScroll() }
+    }
 
     private let config: Config
     private let model: GazeModel
-    private let pipeline: CameraPipeline
-    private let overlay: GazeOverlay?
     private let verbose: Bool
     private let windows = WindowCache()
     private let scroller = Scroller()
     private let status = StatusLine()
+    private var overlay: GazeOverlay?
     private var hotkey: GlobalHotkey?
-    private var enabled: Bool
     private var filter = PointFilter(minCutoff: 0.5, beta: 0.005)
     private var dwell: DwellSelector<UInt32>
     private var gestures = HandGestureRecognizer()
@@ -128,13 +183,13 @@ final class RunCommand {
     private var scrollSource = ScrollSource.none
     private var lastEyeScroll = 0.0
 
-    init(config: Config, showGaze: Bool, verbose: Bool) {
+    init(config: Config, model: GazeModel, showGaze: Bool, verbose: Bool = false) {
         self.config = config
+        self.model = model
+        self.showGaze = showGaze
         self.verbose = verbose
-        model = loadModel(required: true)!
         enabled = config.startEnabled
-        pipeline = CameraPipeline(tracksHands: config.scrollMode.usesHands || config.gestureToggle)
-        overlay = showGaze ? GazeOverlay() : nil
+        scrollMode = config.scrollMode
         dwell = DwellSelector(dwell: config.dwellMs / 1000)
         gestures.scrollGain *= config.handScrollSpeed * (config.invertHandScroll ? -1 : 1)
         eyeScroller.maxSpeed *= config.eyeScrollSpeed
@@ -142,37 +197,30 @@ final class RunCommand {
         eyeScroller.dwell = config.eyeScrollDwellMs / 1000
     }
 
-    func start() {
-        Permissions.waitForAccessibility { [self] in
-            if let spec = HotkeySpec.parse(config.hotkey) {
-                hotkey = GlobalHotkey(spec) { [weak self] in self?.toggle() }
-                if hotkey == nil { print("Couldn't register the shortcut \(config.hotkey); another app may be using it.") }
-            } else {
-                print("Couldn't understand the shortcut \"\(config.hotkey)\" in \(Storage.configURL.path).")
-            }
-            var toggles = ["\(config.hotkey) to turn on/off"]
-            if config.gestureToggle { toggles.append("hold up an open palm") }
-            print("gaze-switch is \(enabled ? "on" : "off"). \(toggles.joined(separator: ", or ")). Scrolling: \(config.scrollMode.rawValue).")
-            if config.scrollMode.usesHands { print("Pinch your thumb and index finger, then move your hand up or down to scroll.") }
-            if config.scrollMode.usesEyes { print("Look near the top or bottom edge of a window to scroll it.") }
-            print("Press Ctrl-C to quit.")
-            pipeline.start(cameraName: config.camera) { [weak self] in self?.handle($0) }
+    /// Returns a description of the problem if the shortcut couldn't be set up.
+    func registerHotkey() -> String? {
+        guard let spec = HotkeySpec.parse(config.hotkey) else {
+            return "Couldn't understand the shortcut \"\(config.hotkey)\" in \(Storage.configURL.path)."
         }
+        hotkey = GlobalHotkey(spec) { [weak self] in self?.toggle() }
+        return hotkey == nil ? "Couldn't register the shortcut \(config.hotkey); another app may be using it." : nil
     }
 
-    func stop() {
-        scroller.end()
-    }
-
-    private func toggle() {
+    func toggle() {
         enabled.toggle()
         endScroll()
         dwell.reset()
         Feedback.play(enabled ? "Tink" : "Bottle", enabled: config.sounds)
         Feedback.log("gaze-switch \(enabled ? "on" : "off")")
+        onToggle?(enabled)
     }
 
-    private func handle(_ frame: FrameResult) {
+    func stop() {
+        endScroll()
+        overlay?.show(at: nil, color: .clear)
+    }
+
+    func handle(_ frame: FrameResult) {
         let t = frame.time
         let windowList = windows.get(at: t)
         updateGaze(frame)
@@ -181,8 +229,11 @@ final class RunCommand {
         for event in gestures.update(frame.hand, at: t) { handle(event, windows: windowList) }
 
         defer {
-            let color: NSColor = !enabled ? .systemGray : scroller.isActive ? .systemBlue : .systemGreen
-            overlay?.show(at: gaze?.point, color: color)
+            if showGaze {
+                if overlay == nil { overlay = GazeOverlay() }
+                let color: NSColor = !enabled ? .systemGray : scroller.isActive ? .systemBlue : .systemGreen
+                overlay?.show(at: gaze?.point, color: color)
+            }
             if verbose { status.update(describe(gaze, model: model, windows: windowList), at: t) }
         }
         guard enabled else { return }
@@ -199,7 +250,7 @@ final class RunCommand {
             }
         }
 
-        if config.scrollMode.usesEyes && scrollSource != .hands {
+        if scrollMode.usesEyes && scrollSource != .hands {
             let delta = eyeScroller.update(gaze: gaze?.point, window: looking?.frame, at: t)
             if delta != 0, let looking {
                 if scrollSource == .none {
@@ -235,7 +286,7 @@ final class RunCommand {
         case .toggle:
             if config.gestureToggle { toggle() }
         case .scrollBegan:
-            guard enabled, config.scrollMode.usesHands else { return }
+            guard enabled, scrollMode.usesHands else { return }
             endScroll()
             // Eyes pick the window; fall back to the frontmost one when you're looking away.
             let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier

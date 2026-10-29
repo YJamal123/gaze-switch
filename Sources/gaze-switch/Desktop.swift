@@ -188,7 +188,7 @@ enum Permissions {
         if AXIsProcessTrustedWithOptions(options) { return done() }
         print("""
         gaze-switch needs Accessibility access to switch windows and scroll.
-        Open System Settings → Privacy & Security → Accessibility and turn on your terminal app.
+        Open System Settings → Privacy & Security → Accessibility and turn on \(permissionHolder).
         Waiting…
         """)
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { timer in

@@ -20,13 +20,33 @@ Other:
   --camera NAME                     Use the camera whose name contains NAME
 """
 
+var arguments = Array(CommandLine.arguments.dropFirst())
+// Opened from Finder or the Dock: running inside a .app bundle with no command.
+let appMode = Bundle.main.bundlePath.hasSuffix(".app") && arguments.allSatisfy { $0.hasPrefix("-psn_") }
+/// Who macOS gives camera and Accessibility access to.
+let permissionHolder = appMode ? "gaze-switch" : "your terminal app"
+
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write(Data((message + "\n").utf8))
+    if appMode {
+        let alert = NSAlert()
+        alert.messageText = "gaze-switch can't continue"
+        alert.informativeText = message
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
     exit(1)
 }
 
-var arguments = Array(CommandLine.arguments.dropFirst())
-let command = arguments.isEmpty ? "help" : arguments.removeFirst()
+if appMode {
+    // There's no terminal to print to, so keep a log instead.
+    let log = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/gaze-switch.log").path
+    freopen(log, "a", stdout)
+    freopen(log, "a", stderr)
+}
+setvbuf(stdout, nil, _IOLBF, 0)
+
+let command = appMode ? "app" : arguments.isEmpty ? "help" : arguments.removeFirst()
 
 func flag(_ name: String) -> Bool { arguments.contains(name) }
 func option(_ name: String) -> String? {
@@ -42,15 +62,18 @@ if let mode = option("--scroll") {
     config.scrollMode = scrollMode
 }
 
-setvbuf(stdout, nil, _IOLBF, 0)
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
+app.setActivationPolicy(appMode ? .regular : .accessory)
 
 // Commands live here for the life of the process.
 var running: AnyObject?
 var interrupt: DispatchSourceSignal?
 
 switch command {
+case "app":
+    let controller = AppController(config: config)
+    app.delegate = controller
+    running = controller
 case "track":
     let track = TrackCommand(config: config, showGaze: flag("--show-gaze"))
     track.start()

@@ -7,15 +7,21 @@ final class GlobalHotkey {
     private static var actions: [UInt32: () -> Void] = [:]
     private static var nextID: UInt32 = 1
     private static var handlerInstalled = false
+    private let id: UInt32
     private var ref: EventHotKeyRef?
 
     init?(_ spec: HotkeySpec, action: @escaping () -> Void) {
         Self.installHandler()
-        let id = Self.nextID
+        id = Self.nextID
         Self.nextID += 1
         let hotKeyID = EventHotKeyID(signature: 0x475A_5357, id: id) // 'GZSW'
         guard RegisterEventHotKey(spec.keyCode, spec.modifiers, hotKeyID, GetApplicationEventTarget(), 0, &ref) == noErr else { return nil }
         Self.actions[id] = action
+    }
+
+    deinit {
+        if let ref { UnregisterEventHotKey(ref) }
+        Self.actions[id] = nil
     }
 
     private static func installHandler() {

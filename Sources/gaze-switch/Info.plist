@@ -6,6 +6,20 @@
 	<string>com.yjamal.gaze-switch</string>
 	<key>CFBundleName</key>
 	<string>gaze-switch</string>
+	<key>CFBundleDisplayName</key>
+	<string>gaze-switch</string>
+	<key>CFBundleExecutable</key>
+	<string>gaze-switch</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>gaze-switch uses the camera to see which window you are looking at and to read hand gestures. Video never leaves your Mac.</string>
 </dict>

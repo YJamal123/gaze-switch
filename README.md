@@ -11,15 +11,31 @@ Nothing leaves your Mac. Video is processed on-device with Apple's Vision framew
 - Xcode or the Xcode Command Line Tools (for `swift build`)
 - A webcam. The built-in camera works; Continuity Camera and USB cameras work too.
 
-## Build
+## The app
+
+```bash
+./scripts/build-app.sh --install
+```
+
+This builds `gaze-switch.app` and copies it to `/Applications`. Leave off `--install` to only build it into `build/`. Open it like any other app:
+
+1. macOS asks for camera access, then Accessibility access. Both go to gaze-switch alone, not to your terminal.
+2. The first time, it walks you through calibration.
+3. After that it runs in the Dock. Its menu, in the menu bar or from right-clicking the Dock icon, turns it on and off, shows the gaze dot, picks how to scroll and recalibrates.
+
+If your screens change, it offers to recalibrate the next time it opens. Messages go to `~/Library/Logs/gaze-switch.log`. Changes made in the settings file apply the next time the app opens.
+
+Without a code-signing certificate, the app is "ad-hoc" signed, so macOS treats each rebuild as a new app and asks for permissions again. If permissions stop working after a rebuild, remove gaze-switch from System Settings → Privacy & Security → Accessibility and open it again. To avoid this, set `SIGN_IDENTITY` to your certificate's name when running the script.
+
+## Command line
 
 ```bash
 swift build -c release
 ```
 
-The program is then at `.build/release/gaze-switch`. All the commands below run from the repo folder.
+The program is then at `.build/release/gaze-switch`. All the commands below run from the repo folder. From the command line, macOS gives camera and Accessibility access to your terminal app instead.
 
-## Use it
+## Use it from the command line
 
 **1. Check the camera can see you**
 
@@ -91,7 +107,7 @@ macOS sends scroll events to the window under the mouse pointer. So while you sc
 - Light your face from the front. Strong light behind you makes eye tracking much worse.
 - Telling split-screen halves apart works best side by side. Top and bottom halves are harder because webcams read up-and-down eye movement less precisely.
 - Glasses with strong reflections can hide your pupils. Head direction still works, but small eye-only glances count for less.
-- Because it runs from Terminal, macOS grants camera and Accessibility access to your terminal app, so other programs you run from it get the same access.
+- From the command line, macOS grants camera and Accessibility access to your terminal app, so other programs you run from it get the same access. Use the app to avoid that.
 
 ## Development
 

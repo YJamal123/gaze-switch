@@ -71,6 +71,10 @@ public enum Storage {
         return try JSONDecoder().decode(Config.self, from: Data(contentsOf: configURL))
     }
 
+    public static func saveConfig(_ config: Config) throws {
+        try save(config, to: configURL)
+    }
+
     public static func loadCalibration() throws -> GazeModel? {
         guard FileManager.default.fileExists(atPath: calibrationURL.path) else { return nil }
         let decoder = JSONDecoder()
