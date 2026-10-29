@@ -72,7 +72,7 @@ final class TrackCommand {
         if let f = frame.face {
             parts.append(String(format: "head yaw %+5.1f° pitch %+5.1f°", f.yaw * 180 / .pi, f.pitch * 180 / .pi))
             parts.append(String(format: "nose %+.2f %+.2f", f.noseX, f.noseY))
-            parts.append(f.eyesOpen ? String(format: "eyes %+.2f %+.2f", f.eyeX, f.eyeY) : "eyes closed")
+            parts.append(f.eyesOpen ? String(format: "eyes %+.2f %+.2f lids %.2f", f.eyeX, f.eyeY, f.eyelids) : "blink")
             if let model, f.eyesOpen {
                 var p = model.predict(f.vector, awayMargin: config.awayMargin)
                 if let raw = p { p?.point = filter.filter(raw.point, at: frame.time) } else { filter.reset() }
@@ -156,10 +156,11 @@ final class RunCommand {
 
 /// Activates the window you look at and scrolls it with hand gestures or your eyes.
 final class Switcher {
-    private enum ScrollSource { case none, hands, eyes }
+    enum ScrollSource { case none, hands, eyes }
 
     var onToggle: ((Bool) -> Void)?
     private(set) var enabled: Bool
+    private(set) var scrollSource = ScrollSource.none
     var showGaze: Bool {
         didSet { if !showGaze { overlay?.show(at: nil, color: .clear) } }
     }
@@ -180,8 +181,13 @@ final class Switcher {
     private var gestures = HandGestureRecognizer()
     private var eyeScroller = EyeScroller()
     private var gaze: GazeModel.Prediction?
-    private var scrollSource = ScrollSource.none
+    private var drift = DriftCorrector()
+    private var policy: SwitchPolicy
+    private var inputMonitors: [Any] = []
+    private var focusedID: UInt32?
+    private var lastFailedID: UInt32?
     private var lastEyeScroll = 0.0
+    private var lastScrollEnd = -Double.infinity
 
     init(config: Config, model: GazeModel, showGaze: Bool, verbose: Bool = false) {
         self.config = config
@@ -191,10 +197,37 @@ final class Switcher {
         enabled = config.startEnabled
         scrollMode = config.scrollMode
         dwell = DwellSelector(dwell: config.dwellMs / 1000)
+        policy = SwitchPolicy(dwell: config.dwellMs / 1000)
         gestures.scrollGain *= config.handScrollSpeed * (config.invertHandScroll ? -1 : 1)
         eyeScroller.maxSpeed *= config.eyeScrollSpeed
         eyeScroller.edgeFraction = config.eyeScrollEdge
         eyeScroller.dwell = config.eyeScrollDwellMs / 1000
+        // Seeing input in other apps needs Accessibility access, which switching needs anyway.
+        // Only the timing of key presses is used, never which keys.
+        let monitors = [
+            NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
+                self?.learnFromClick()
+                self?.pointerUsed()
+            },
+            NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .rightMouseDown, .otherMouseDown, .scrollWheel]) { [weak self] _ in
+                self?.pointerUsed()
+            },
+            NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] _ in
+                self?.policy.keyPressed(at: ProcessInfo.processInfo.systemUptime)
+            },
+        ]
+        inputMonitors = monitors.compactMap { $0 }
+    }
+
+    deinit {
+        inputMonitors.forEach(NSEvent.removeMonitor)
+    }
+
+    private func pointerUsed() {
+        let t = ProcessInfo.processInfo.systemUptime
+        // Our own scroll events show up here too; they aren't you using the mouse.
+        guard !scroller.isActive, t - lastScrollEnd > 0.5 else { return }
+        policy.pointerUsed(at: t)
     }
 
     /// Returns a description of the problem if the shortcut couldn't be set up.
@@ -239,15 +272,14 @@ final class Switcher {
         guard enabled else { return }
 
         let looking = gaze.flatMap { topWindow(at: $0.point, in: windowList) }
-        // Hold focus still while scrolling, so the window doesn't change mid-gesture.
-        if !scroller.isActive, let id = dwell.update(looking?.id, at: t), let window = windowList.first(where: { $0.id == id }) {
-            if !Windows.isFocused(window) {
-                if Windows.activate(window) {
-                    if verbose { status.finish() }
-                    Feedback.log("→ \(window.label)")
-                }
-                windows.invalidate()
-            }
+        // Hold focus still while scrolling, so the window doesn't change mid-gesture,
+        // and while you're using the mouse, so a stray look doesn't undercut it.
+        let required = scroller.isActive ? nil : policy.requiredDwell(for: looking?.id, at: t)
+        if let required, let id = dwell.update(looking?.id, at: t, dwell: required),
+           let window = windowList.first(where: { $0.id == id }) {
+            switchTo(window, at: t)
+        } else if required == nil {
+            _ = dwell.update(nil, at: t)
         }
 
         if scrollMode.usesEyes && scrollSource != .hands {
@@ -256,6 +288,7 @@ final class Switcher {
                 if scrollSource == .none {
                     scroller.begin(in: looking, at: gaze?.point)
                     scrollSource = .eyes
+                    Feedback.log("Scrolling \(looking.label) with your eyes \(delta > 0 ? "up" : "down")")
                 }
                 scroller.scroll(delta)
                 lastEyeScroll = t
@@ -273,12 +306,36 @@ final class Switcher {
         }
         // Mid-blink the pupils can't be read, so keep the last gaze.
         guard face.eyesOpen else { return }
-        if let p = model.predict(face.vector, awayMargin: config.awayMargin) {
+        if let raw = model.predict(face.vector, awayMargin: config.awayMargin) {
+            let p = drift.apply(raw, displays: model.displays)
             gaze = GazeModel.Prediction(point: filter.filter(p.point, at: frame.time), displayID: p.displayID)
         } else {
             gaze = nil
             filter.reset()
         }
+    }
+
+    private func switchTo(_ window: WindowInfo, at t: Double) {
+        guard !Windows.isFocused(window) else {
+            focusedID = window.id
+            return
+        }
+        if verbose { status.finish() }
+        if Windows.activate(window) {
+            Feedback.log("→ \(window.label)")
+            policy.switched(from: focusedID, at: t)
+            focusedID = window.id
+            lastFailedID = nil
+        } else if lastFailedID != window.id {
+            Feedback.log("Couldn't switch to \(window.label). Is Accessibility access on?")
+            lastFailedID = window.id
+        }
+        windows.invalidate()
+    }
+
+    private func learnFromClick() {
+        guard enabled, !scroller.isActive, let gaze else { return }
+        drift.learn(click: Scroller.cursor, gaze: gaze, displays: model.displays)
     }
 
     private func handle(_ event: GestureEvent, windows windowList: [WindowInfo]) {
@@ -290,9 +347,12 @@ final class Switcher {
             endScroll()
             // Eyes pick the window; fall back to the frontmost one when you're looking away.
             let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
-            guard let target = gaze.flatMap({ topWindow(at: $0.point, in: windowList) }) ?? windowList.first(where: { $0.pid == frontPID }) else { return }
+            guard let target = gaze.flatMap({ topWindow(at: $0.point, in: windowList) }) ?? windowList.first(where: { $0.pid == frontPID }) else {
+                return Feedback.log("Pinch seen, but there's no window to scroll.")
+            }
             scroller.begin(in: target, at: gaze?.point)
             scrollSource = .hands
+            Feedback.log("Scrolling \(target.label) with your hand")
         case .scrolled(let pixels):
             if scrollSource == .hands { scroller.scroll(pixels) }
         case .scrollEnded:
@@ -301,6 +361,7 @@ final class Switcher {
     }
 
     private func endScroll() {
+        if scroller.isActive { lastScrollEnd = ProcessInfo.processInfo.systemUptime }
         scroller.end()
         scrollSource = .none
     }

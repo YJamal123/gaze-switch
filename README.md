@@ -13,6 +13,14 @@ Nothing leaves your Mac. Video is processed on-device with Apple's Vision framew
 
 ## The app
 
+First, once, make a local signing certificate. This lets macOS remember gaze-switch's permissions across rebuilds:
+
+```bash
+./scripts/make-signing-cert.sh
+```
+
+Then build and install:
+
 ```bash
 ./scripts/build-app.sh --install
 ```
@@ -21,11 +29,18 @@ This builds `gaze-switch.app` and copies it to `/Applications`. Leave off `--ins
 
 1. macOS asks for camera access, then Accessibility access. Both go to gaze-switch alone, not to your terminal.
 2. The first time, it walks you through calibration.
-3. After that it runs in the Dock. Its menu, in the menu bar or from right-clicking the Dock icon, turns it on and off, shows the gaze dot, picks how to scroll and recalibrates.
+3. Then a **How to Scroll** window shows the hand and eye gestures. The window is also a practice area: look at it and scroll it, and a live status line tells you what the camera sees, such as "Pinch seen" or "Scrolling with your hand".
+4. After that it runs in the Dock. Its menu, in the menu bar or from right-clicking the Dock icon, turns it on and off, shows the gaze dot, picks how to scroll, reopens How to Scroll and recalibrates.
 
 If your screens change, it offers to recalibrate the next time it opens. Messages go to `~/Library/Logs/gaze-switch.log`. Changes made in the settings file apply the next time the app opens.
 
-Without a code-signing certificate, the app is "ad-hoc" signed, so macOS treats each rebuild as a new app and asks for permissions again. If permissions stop working after a rebuild, remove gaze-switch from System Settings → Privacy & Security → Accessibility and open it again. To avoid this, set `SIGN_IDENTITY` to your certificate's name when running the script.
+Without the certificate, the app is "ad-hoc" signed, so macOS treats each rebuild as a new app. Its old entry in the Accessibility list still looks turned on, but it no longer counts. The certificate fixes that. You can also set `SIGN_IDENTITY` to another certificate's name.
+
+### If it doesn't switch or scroll
+
+- **Is there a "!" on the Dock icon?** Accessibility access is off, and macOS quietly blocks switching and scrolling without it. Choose **Turn On Accessibility Access…** from the gaze-switch menu. If gaze-switch is already listed and turned on, select it, click **−**, then open gaze-switch again and allow it.
+- **Open How to Scroll** from the menu. Its status line shows live what the camera sees and whether a scroll started.
+- **Check the log** at `~/Library/Logs/gaze-switch.log`. It records each window switch, each scroll and any window it couldn't switch to.
 
 ## Command line
 
@@ -98,7 +113,14 @@ Settings live in `~/Library/Application Support/gaze-switch/config.json`, which 
 
 ## How it works
 
-Each camera frame goes through Vision's face-landmark and hand-pose detection. Gaze comes from two signals combined: which way your head points (nose position relative to your eyes, plus Vision's head yaw and pitch) and where your pupils sit within your eyes. Calibration fits a linear model from those signals to screen positions. One model across all screens picks the screen, then a model per screen places the point within it. A 1€ filter smooths the result, and a short dwell stops passing glances from switching windows.
+Each camera frame goes through Vision's face, face-landmark and hand-pose detection. Gaze combines several signals:
+
+- **Head direction:** Vision's head yaw and pitch, the nose's position relative to the eyes, and the nose's position between the edges of the jaw.
+- **Eye direction:** the iris position relative to the eye's corners. gaze-switch finds each iris itself as the darkest iris-sized patch of the eye, in the 1080p frame.
+- **Eyelid opening:** your upper lid drops when you look down, which helps with up and down.
+- **Head position** in the frame, so leaning or shifting is accounted for.
+
+Blinks are told apart from looking down by comparing against your usual eye opening. Calibration fits a linear model from those signals to screen positions. One model across all screens picks the screen, then a model per screen places the point within it. A 1€ filter smooths the result, and a short dwell stops passing glances from switching windows. Following [Focus](https://github.com/OshOEz/focus), it also holds off switching for 1.5 seconds after you move, click or scroll the mouse. While you're typing, a look must last a full second, and going straight back to the window you just left takes twice as long a look. Each mouse click also nudges the estimate toward where you clicked, since you're usually looking there, which corrects drift when you shift in your seat. Clicks far from where it thinks you're looking are ignored.
 
 macOS sends scroll events to the window under the mouse pointer. So while you scroll, gaze-switch parks the pointer in the window you're looking at, then puts it back when you stop.
 

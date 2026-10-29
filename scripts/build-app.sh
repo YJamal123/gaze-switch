@@ -1,7 +1,8 @@
 #!/bin/bash
 # Builds gaze-switch.app into ./build. Pass --install to also copy it to /Applications.
-# Set SIGN_IDENTITY to a code-signing certificate's name to keep permissions across rebuilds;
-# without one the app is ad-hoc signed and macOS asks for permissions again after each rebuild.
+# It signs with SIGN_IDENTITY if set, else with the "gaze-switch local" certificate from
+# make-signing-cert.sh if you've made one. Either keeps permissions across rebuilds. Without one
+# the app is ad-hoc signed, and macOS asks for permissions again after each rebuild.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -12,8 +13,12 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
 cp .build/release/gaze-switch "$app/Contents/MacOS/gaze-switch"
 cp Sources/gaze-switch/Info.plist "$app/Contents/Info.plist"
-codesign --force --sign "${SIGN_IDENTITY:--}" "$app"
-echo "Built $app"
+identity="${SIGN_IDENTITY:-}"
+if [[ -z "$identity" ]] && security find-certificate -c "gaze-switch local" >/dev/null 2>&1; then
+    identity="gaze-switch local"
+fi
+codesign --force --sign "${identity:--}" "$app"
+echo "Built $app (signed with ${identity:-an ad-hoc signature})"
 
 if [[ "${1:-}" == "--install" ]]; then
     rm -rf /Applications/gaze-switch.app

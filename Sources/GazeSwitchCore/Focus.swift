@@ -37,7 +37,8 @@ public struct DwellSelector<Value: Equatable> {
     }
 
     /// Returns the value at the moment it is committed, and nil otherwise.
-    public mutating func update(_ value: Value?, at t: Double) -> Value? {
+    /// `dwell` overrides the usual dwell for this look, such as to ask for a longer one while typing.
+    public mutating func update(_ value: Value?, at t: Double, dwell: Double? = nil) -> Value? {
         guard let value, value != current else {
             candidate = nil
             return nil
@@ -46,7 +47,7 @@ public struct DwellSelector<Value: Equatable> {
             candidate = value
             candidateSince = t
         }
-        guard t - candidateSince >= dwell else { return nil }
+        guard t - candidateSince >= dwell ?? self.dwell else { return nil }
         current = value
         candidate = nil
         return value
@@ -55,5 +56,45 @@ public struct DwellSelector<Value: Equatable> {
     public mutating func reset() {
         current = nil
         candidate = nil
+    }
+}
+
+/// How long a look must last before switching, depending on what you're doing.
+/// Modeled on Focus (github.com/OshOEz/focus): mouse use blocks switching, typing asks for a longer look,
+/// and going straight back to the window you just left asks for a firmer one.
+public struct SwitchPolicy {
+    public var dwell: Double
+    /// No switching for this long after you move, click or scroll the mouse.
+    public var pointerGrace = 1.5
+    /// While you've typed within `typingWindow` seconds, a look must last at least this long.
+    public var typingDwell = 1.0
+    public var typingWindow = 1.5
+    /// Going back to the window you left within `returnWindow` seconds takes this many times the usual dwell.
+    public var returnFactor = 2.0
+    public var returnWindow = 2.0
+
+    public private(set) var lastPointer = -Double.infinity
+    public private(set) var lastKey = -Double.infinity
+    private var lastSwitch = -Double.infinity
+    private var previous: UInt32?
+
+    public init(dwell: Double) {
+        self.dwell = dwell
+    }
+
+    public mutating func pointerUsed(at t: Double) { lastPointer = t }
+    public mutating func keyPressed(at t: Double) { lastKey = t }
+
+    public mutating func switched(from old: UInt32?, at t: Double) {
+        previous = old
+        lastSwitch = t
+    }
+
+    /// Nil while switching is blocked; otherwise how long a look at `candidate` must last.
+    public func requiredDwell(for candidate: UInt32?, at t: Double) -> Double? {
+        guard t - lastPointer >= pointerGrace else { return nil }
+        var d = t - lastKey < typingWindow ? max(dwell, typingDwell) : dwell
+        if let candidate, candidate == previous, t - lastSwitch < returnWindow { d *= returnFactor }
+        return d
     }
 }

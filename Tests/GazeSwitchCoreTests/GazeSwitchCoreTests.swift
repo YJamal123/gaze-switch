@@ -17,6 +17,14 @@ final class LinearModelTests: XCTestCase {
         XCTAssertEqual(model.predict([3, 1])[0], 30, accuracy: 1e-3)
     }
 
+    func testNoiseFloorDampsBarelyMovingFeatures() throws {
+        // The second feature barely moves in training; without a floor a later jump in it would swing the output.
+        let inputs = (0..<30).map { [Double($0), 1 + Double($0 % 2) * 1e-4] }
+        let outputs = inputs.map { [$0[0] + ($0[1] - 1) * 1e4] }
+        let model = try XCTUnwrap(LinearModel.fit(inputs: inputs, outputs: outputs, lambda: 0.05, minScale: [0, 0.1]))
+        XCTAssertLessThan(abs(model.predict([10, 2])[0] - model.predict([10, 1])[0]), 50)
+    }
+
     func testNeedsMoreSamplesThanFeatures() {
         XCTAssertNil(LinearModel.fit(inputs: [[1, 2]], outputs: [[1]]))
     }
@@ -28,7 +36,7 @@ final class GazeModelTests: XCTestCase {
 
     /// Synthetic features where head yaw maps straight to x and pitch to y.
     func features(for p: CGPoint) -> [Double] {
-        [p.x / 1000, p.y / 1000, p.x / 2000, 0, 0, 0]
+        [p.x / 1000, p.y / 1000, p.x / 2000, 0, 0, 0, 0, 0, 0, 0]
     }
 
     func model() throws -> GazeModel {
@@ -76,6 +84,64 @@ final class GazeModelTests: XCTestCase {
     }
 }
 
+final class EyeTests: XCTestCase {
+    /// A bright eye opening with a dark iris at `iris`, in a 60×30 image.
+    func withEye(iris: CGPoint, _ body: (GrayImage, [CGPoint]) -> Void) {
+        let width = 60, height = 30
+        var pixels = [UInt8](repeating: 40, count: width * height)
+        for y in 0..<height {
+            for x in 0..<width {
+                let inEye = pow((Double(x) - 30) / 25, 2) + pow((Double(y) - 15) / 10, 2) <= 1
+                let inIris = hypot(Double(x) + 0.5 - iris.x, Double(y) + 0.5 - iris.y) <= 6
+                if inEye { pixels[y * width + x] = inIris ? 30 : 220 }
+            }
+        }
+        let contour = (0..<16).map { i -> CGPoint in
+            let a = Double(i) / 16 * 2 * .pi
+            return CGPoint(x: 30 + 25 * cos(a), y: 15 + 10 * sin(a))
+        }
+        pixels.withUnsafeBufferPointer { buffer in
+            body(GrayImage(width: width, height: height, rowBytes: width, pixels: buffer.baseAddress!), contour)
+        }
+    }
+
+    func testFindsTheIris() {
+        for iris in [CGPoint(x: 30, y: 15), CGPoint(x: 18, y: 14), CGPoint(x: 41, y: 17)] {
+            withEye(iris: iris) { image, contour in
+                let found = IrisLocator.locate(in: image, contour: contour)
+                XCTAssertEqual(found?.x ?? 0, iris.x, accuracy: 1.5)
+                XCTAssertEqual(found?.y ?? 0, iris.y, accuracy: 1.5)
+            }
+        }
+    }
+
+    func testPolygonContainment() {
+        let square = [CGPoint(x: 0, y: 0), CGPoint(x: 10, y: 0), CGPoint(x: 10, y: 10), CGPoint(x: 0, y: 10)]
+        XCTAssertTrue(IrisLocator.contains(square, CGPoint(x: 5, y: 5)))
+        XCTAssertFalse(IrisLocator.contains(square, CGPoint(x: 15, y: 5)))
+    }
+
+    func testLookingDownIsNotABlink() {
+        var blinks = BlinkDetector()
+        for _ in 0..<60 { _ = blinks.eyesOpen(opening: 0.30) }
+        XCTAssertTrue(blinks.eyesOpen(opening: 0.21), "lids drop about a third when looking down")
+        XCTAssertFalse(blinks.eyesOpen(opening: 0.08), "a blink nearly closes them")
+        XCTAssertTrue(blinks.eyesOpen(opening: 0.30))
+    }
+
+    func testClicksCorrectDrift() {
+        let display = DisplaySnapshot(id: 1, frame: CGRect(x: 0, y: 0, width: 1000, height: 600), name: "")
+        var drift = DriftCorrector()
+        let raw = GazeModel.Prediction(point: CGPoint(x: 500, y: 300), displayID: 1)
+        // You keep clicking 60px right of where the model thinks you're looking.
+        for _ in 0..<15 {
+            drift.learn(click: CGPoint(x: 560, y: 300), gaze: drift.apply(raw, displays: [display]), displays: [display])
+        }
+        XCTAssertEqual(drift.apply(raw, displays: [display]).point.x, 560, accuracy: 2)
+        XCTAssertFalse(drift.learn(click: CGPoint(x: 990, y: 590), gaze: raw, displays: [display]), "far-off clicks are ignored")
+    }
+}
+
 final class FocusTests: XCTestCase {
     func testTopWindowPrefersFront() {
         let back = WindowInfo(id: 1, pid: 1, owner: "A", title: "", frame: CGRect(x: 0, y: 0, width: 800, height: 800))
@@ -96,6 +162,32 @@ final class FocusTests: XCTestCase {
         XCTAssertNil(dwell.update(2, at: 0.8))
         XCTAssertNil(dwell.update(2, at: 1.0))
         XCTAssertEqual(dwell.update(2, at: 1.1), 2)
+    }
+
+    func testMouseUseBlocksSwitching() {
+        var policy = SwitchPolicy(dwell: 0.35)
+        XCTAssertEqual(policy.requiredDwell(for: 1, at: 10), 0.35)
+        policy.pointerUsed(at: 10)
+        XCTAssertNil(policy.requiredDwell(for: 1, at: 11), "blocked right after using the mouse")
+        XCTAssertEqual(policy.requiredDwell(for: 1, at: 11.6), 0.35)
+    }
+
+    func testTypingAndGoingBackNeedLongerLooks() {
+        var policy = SwitchPolicy(dwell: 0.35)
+        policy.keyPressed(at: 10)
+        XCTAssertEqual(policy.requiredDwell(for: 1, at: 10.5), 1.0, "typing asks for a longer look")
+        XCTAssertEqual(policy.requiredDwell(for: 1, at: 12), 0.35)
+        policy.switched(from: 7, at: 20)
+        XCTAssertEqual(policy.requiredDwell(for: 7, at: 21), 0.7, "going straight back takes a firmer look")
+        XCTAssertEqual(policy.requiredDwell(for: 8, at: 21), 0.35)
+        XCTAssertEqual(policy.requiredDwell(for: 7, at: 23), 0.35)
+    }
+
+    func testDwellOverride() {
+        var dwell = DwellSelector<Int>(dwell: 0.3)
+        XCTAssertNil(dwell.update(1, at: 0, dwell: 1))
+        XCTAssertNil(dwell.update(1, at: 0.5, dwell: 1))
+        XCTAssertEqual(dwell.update(1, at: 1.0, dwell: 1), 1)
     }
 
     func testOneEuroSettlesOnConstantInput() {

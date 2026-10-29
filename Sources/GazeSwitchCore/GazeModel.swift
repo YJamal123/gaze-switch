@@ -3,32 +3,47 @@ import Foundation
 
 /// What one camera frame says about where the face and eyes point.
 public struct GazeFeatures: Equatable {
-    /// Head turn and tilt in radians, as reported by Vision.
+    /// Head turn and tilt in radians, from Vision's face detector.
     public var yaw: Double
     public var pitch: Double
     /// Nose offset from the midpoint between the eyes, in units of eye-to-eye distance.
-    /// This tracks head turn more smoothly than Vision's yaw and pitch.
     public var noseX: Double
     public var noseY: Double
-    /// Pupil offset from the center of the eye, in units of half the eye's width.
+    /// Where the nose sits between the left and right edges of the jaw, from -0.5 to 0.5.
+    public var jawX: Double
+    /// Iris offset from the midpoint of the eye's corners, in units of half the eye's width.
     public var eyeX: Double
     public var eyeY: Double
-    /// False while blinking, when the pupil positions are unreliable.
+    /// Eye opening height over width. The upper lid drops when you look down.
+    public var eyelids: Double
+    /// The midpoint between the eyes in the camera frame, from 0 to 1, so moving your head is accounted for.
+    public var faceX: Double
+    public var faceY: Double
+    /// False while blinking, when the iris positions are unreliable.
     public var eyesOpen: Bool
 
-    public static let vectorCount = 6
+    public static let vectorCount = 10
 
-    public init(yaw: Double, pitch: Double, noseX: Double, noseY: Double, eyeX: Double, eyeY: Double, eyesOpen: Bool) {
+    /// Changes smaller than these count as noise when fitting, so a signal that barely moved
+    /// during calibration can't swing predictions wildly later.
+    public static let noiseFloor: [Double] = [0.02, 0.02, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01]
+
+    public init(yaw: Double, pitch: Double, noseX: Double, noseY: Double, jawX: Double,
+                eyeX: Double, eyeY: Double, eyelids: Double, faceX: Double, faceY: Double, eyesOpen: Bool) {
         self.yaw = yaw
         self.pitch = pitch
         self.noseX = noseX
         self.noseY = noseY
+        self.jawX = jawX
         self.eyeX = eyeX
         self.eyeY = eyeY
+        self.eyelids = eyelids
+        self.faceX = faceX
+        self.faceY = faceY
         self.eyesOpen = eyesOpen
     }
 
-    public var vector: [Double] { [yaw, pitch, noseX, noseY, eyeX, eyeY] }
+    public var vector: [Double] { [yaw, pitch, noseX, noseY, jawX, eyeX, eyeY, eyelids, faceX, faceY] }
 }
 
 /// A display and where it sits, in global display coordinates (origin at the top-left of the main display).
@@ -91,7 +106,8 @@ public struct GazeModel: Codable {
 
     public static func fit(samples: [CalibrationSample], displays: [DisplaySnapshot], lambda: Double = 0.05) -> GazeModel? {
         func fit(_ s: [CalibrationSample]) -> LinearModel? {
-            LinearModel.fit(inputs: s.map(\.features), outputs: s.map { [$0.target.x, $0.target.y] }, lambda: lambda)
+            LinearModel.fit(inputs: s.map(\.features), outputs: s.map { [$0.target.x, $0.target.y] },
+                            lambda: lambda, minScale: GazeFeatures.noiseFloor)
         }
         guard let global = fit(samples) else { return nil }
         let local = displays.compactMap { d in

@@ -45,8 +45,12 @@ final class Camera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         self.device = device
         super.init()
         session.beginConfiguration()
-        // Higher resolution gives the pupil landmarks more pixels to work with.
-        if session.canSetSessionPreset(.hd1280x720) { session.sessionPreset = .hd1280x720 }
+        // Higher resolution gives the irises more pixels to work with.
+        if session.canSetSessionPreset(.hd1920x1080) {
+            session.sessionPreset = .hd1920x1080
+        } else if session.canSetSessionPreset(.hd1280x720) {
+            session.sessionPreset = .hd1280x720
+        }
         let input = try AVCaptureDeviceInput(device: device)
         let output = AVCaptureVideoDataOutput()
         output.alwaysDiscardsLateVideoFrames = true

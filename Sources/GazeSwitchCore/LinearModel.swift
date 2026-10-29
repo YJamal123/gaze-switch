@@ -17,7 +17,9 @@ public struct LinearModel: Codable, Equatable {
     }
 
     /// `lambda` is relative to the sample count, so 0.05 shrinks the weights by roughly 5%.
-    public static func fit(inputs: [[Double]], outputs: [[Double]], lambda: Double = 0.05) -> LinearModel? {
+    /// `minScale` gives each feature a smallest standard deviation, so a feature that barely varied
+    /// in the training data isn't blown up to a huge standardized value later.
+    public static func fit(inputs: [[Double]], outputs: [[Double]], lambda: Double = 0.05, minScale: [Double]? = nil) -> LinearModel? {
         guard let d = inputs.first?.count, d > 0, inputs.count > d, inputs.count == outputs.count,
               let k = outputs.first?.count, k > 0 else { return nil }
         let n = Double(inputs.count)
@@ -27,7 +29,10 @@ public struct LinearModel: Codable, Equatable {
         mean = mean.map { $0 / n }
         var scale = [Double](repeating: 0, count: d)
         for x in inputs { for i in 0..<d { scale[i] += (x[i] - mean[i]) * (x[i] - mean[i]) } }
-        scale = scale.map { let s = ($0 / n).squareRoot(); return s > 1e-9 ? s : 1 }
+        scale = scale.enumerated().map { i, v in
+            let s = max((v / n).squareRoot(), minScale?[i] ?? 0)
+            return s > 1e-9 ? s : 1
+        }
 
         // Normal equations over design rows [1, z1 ... zd]; the bias is not regularized.
         let m = d + 1

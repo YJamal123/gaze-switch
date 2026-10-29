@@ -9,38 +9,46 @@ struct FrameResult {
     var hand: HandSample?
 }
 
-/// Runs Vision's face-landmark and hand-pose detection on camera frames.
+/// Runs Vision's face and hand-pose detection on camera frames, and finds the irises itself.
 final class VisionTracker {
-    private let faceRequest = VNDetectFaceLandmarksRequest()
+    // The rectangles request reports head yaw and pitch; the landmarks request doesn't.
+    private let faceRequest = VNDetectFaceRectanglesRequest()
+    private let landmarksRequest = VNDetectFaceLandmarksRequest()
     private let handRequest = VNDetectHumanHandPoseRequest()
     private let tracksHands: Bool
+    private var blinks = BlinkDetector()
 
     init(tracksHands: Bool) {
         self.tracksHands = tracksHands
-        faceRequest.revision = VNDetectFaceLandmarksRequestRevision3
+        faceRequest.revision = VNDetectFaceRectanglesRequestRevision3
+        landmarksRequest.revision = VNDetectFaceLandmarksRequestRevision3
         handRequest.maximumHandCount = 1
     }
 
     /// Call from one queue at a time; the requests are reused between frames.
     func process(_ pixelBuffer: CVPixelBuffer, time: Double) -> FrameResult {
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-        let requests: [VNRequest] = tracksHands ? [faceRequest, handRequest] : [faceRequest]
-        do { try handler.perform(requests) } catch { return FrameResult(time: time) }
-
         let size = CGSize(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
-        // The largest face is the person sitting closest to the camera.
-        let face = faceRequest.results?
-            .max { $0.boundingBox.width < $1.boundingBox.width }
-            .flatMap { Self.features(of: $0, imageSize: size) }
-        let hand = tracksHands ? handRequest.results?.first.flatMap { Self.sample(of: $0, aspect: size.width / size.height) } : nil
-        return FrameResult(time: time, face: face, hand: hand)
+        var result = FrameResult(time: time)
+        do {
+            try handler.perform(tracksHands ? [faceRequest, handRequest] : [faceRequest])
+            if tracksHands { result.hand = handRequest.results?.first.flatMap { Self.sample(of: $0, aspect: size.width / size.height) } }
+            // The largest face is the person sitting closest to the camera.
+            guard let face = faceRequest.results?.max(by: { $0.boundingBox.width < $1.boundingBox.width }) else { return result }
+            landmarksRequest.inputFaceObservations = [face]
+            try handler.perform([landmarksRequest])
+            guard let landmarks = landmarksRequest.results?.first?.landmarks else { return result }
+            CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+            result.face = features(pose: face, landmarks: landmarks, image: Self.brightness(of: pixelBuffer), size: size)
+        } catch {}
+        return result
     }
 
-    static func features(of face: VNFaceObservation, imageSize: CGSize) -> GazeFeatures? {
-        guard let landmarks = face.landmarks,
-              let eyeA = landmarks.leftEye?.pointsInImage(imageSize: imageSize), eyeA.count >= 4,
-              let eyeB = landmarks.rightEye?.pointsInImage(imageSize: imageSize), eyeB.count >= 4,
-              let nose = landmarks.nose?.pointsInImage(imageSize: imageSize), !nose.isEmpty
+    private func features(pose: VNFaceObservation, landmarks: VNFaceLandmarks2D, image: GrayImage?, size: CGSize) -> GazeFeatures? {
+        guard let eyeA = landmarks.leftEye?.pointsInImage(imageSize: size), eyeA.count >= 4,
+              let eyeB = landmarks.rightEye?.pointsInImage(imageSize: size), eyeB.count >= 4,
+              let nose = landmarks.nose?.pointsInImage(imageSize: size), !nose.isEmpty
         else { return nil }
 
         let centerA = centroid(eyeA), centerB = centroid(eyeB)
@@ -56,31 +64,57 @@ final class VisionTracker {
         }
 
         let noseOffset = local(centroid(nose))
-        var pupilOffsets: [CGPoint] = []
-        var openness: [Double] = []
+        var jawX = 0.0
+        if let jaw = landmarks.faceContour?.pointsInImage(imageSize: size).map(local), jaw.count >= 3 {
+            let left = jaw.map(\.x).min()!, right = jaw.map(\.x).max()!
+            if right - left > 1 { jawX = (noseOffset.x - (left + right) / 2) / (right - left) }
+        }
+
+        var irisOffsets: [CGPoint] = []
+        var openings: [Double] = []
         for (contour, pupil) in [(eyeA, landmarks.leftPupil), (eyeB, landmarks.rightPupil)] {
             let points = contour.map(local)
             let xs = points.map(\.x), ys = points.map(\.y)
             let halfWidth = (xs.max()! - xs.min()!) / 2
             guard halfWidth > 0.5 else { continue }
-            openness.append((ys.max()! - ys.min()!) / (2 * halfWidth))
-            guard let p = pupil?.pointsInImage(imageSize: imageSize).first else { continue }
-            let lp = local(p)
-            pupilOffsets.append(CGPoint(x: (lp.x - (xs.max()! + xs.min()!) / 2) / halfWidth,
-                                        y: (lp.y - (ys.max()! + ys.min()!) / 2) / halfWidth))
+            openings.append((ys.max()! - ys.min()!) / (2 * halfWidth))
+            // Measure from the corners rather than the eye's bounding box, which shifts as the lids move.
+            let inner = points.min { $0.x < $1.x }!, outer = points.max { $0.x < $1.x }!
+            let cornerMid = CGPoint(x: (inner.x + outer.x) / 2, y: (inner.y + outer.y) / 2)
+            // Vision's points have y going up; the image's rows go down.
+            let iris = image.flatMap { img in
+                IrisLocator.locate(in: img, contour: contour.map { CGPoint(x: $0.x, y: size.height - $0.y) })
+                    .map { CGPoint(x: $0.x, y: size.height - $0.y) }
+            } ?? pupil?.pointsInImage(imageSize: size).first
+            guard let iris else { continue }
+            let p = local(iris)
+            irisOffsets.append(CGPoint(x: (p.x - cornerMid.x) / halfWidth, y: (p.y - cornerMid.y) / halfWidth))
         }
-        let eye = pupilOffsets.isEmpty ? .zero : centroid(pupilOffsets)
-        let meanOpenness = openness.isEmpty ? 0 : openness.reduce(0, +) / Double(openness.count)
+        let eye = irisOffsets.isEmpty ? .zero : centroid(irisOffsets)
+        let opening = openings.isEmpty ? 0 : openings.reduce(0, +) / Double(openings.count)
 
         return GazeFeatures(
-            yaw: face.yaw?.doubleValue ?? 0,
-            pitch: face.pitch?.doubleValue ?? 0,
+            yaw: (pose.yaw ?? 0).doubleValue,
+            pitch: (pose.pitch ?? 0).doubleValue,
             noseX: noseOffset.x / interocular,
             noseY: noseOffset.y / interocular,
+            jawX: jawX,
             eyeX: eye.x,
             eyeY: eye.y,
-            eyesOpen: !pupilOffsets.isEmpty && meanOpenness > 0.13
+            eyelids: opening,
+            faceX: mid.x / size.width,
+            faceY: mid.y / size.height,
+            eyesOpen: !irisOffsets.isEmpty && blinks.eyesOpen(opening: opening)
         )
+    }
+
+    /// The brightness plane of a camera frame. The buffer must be locked.
+    private static func brightness(of pixelBuffer: CVPixelBuffer) -> GrayImage? {
+        guard CVPixelBufferIsPlanar(pixelBuffer), let base = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else { return nil }
+        return GrayImage(width: CVPixelBufferGetWidthOfPlane(pixelBuffer, 0),
+                         height: CVPixelBufferGetHeightOfPlane(pixelBuffer, 0),
+                         rowBytes: CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0),
+                         pixels: base.assumingMemoryBound(to: UInt8.self))
     }
 
     /// Converts joints to frame-height units so distances aren't stretched by the frame's aspect ratio.

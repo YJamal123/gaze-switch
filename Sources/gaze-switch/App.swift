@@ -7,8 +7,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuItemValidation
     private let pipeline = CameraPipeline(tracksHands: true)
     private var switcher: Switcher?
     private var calibration: CalibrationController?
+    private var tutorial: TutorialWindowController?
     /// Ignore the camera while an alert is up, so a window switch doesn't bury it.
     private var paused = false
+    /// Without Accessibility access, macOS silently drops window switches and scroll events.
+    private var hasAccess = AXIsProcessTrusted()
+    private var started = false
 
     init(config: Config) {
         self.config = config
@@ -19,7 +23,49 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuItemValidation
             .withSymbolConfiguration(.init(pointSize: 256, weight: .regular).applying(.init(paletteColors: [.white, .systemBlue])))
         NSApp.mainMenu = mainMenu()
         pipeline.start(cameraName: config.camera) { [weak self] in self?.handle($0) }
-        Permissions.waitForAccessibility { [weak self] in self?.startUp() }
+        Feedback.log("Started. Accessibility access: \(hasAccess ? "on" : "off").")
+        showAccessState()
+        if hasAccess {
+            startUp()
+        } else {
+            Permissions.requestAccessibility()
+            // Used before but no access now: most likely a rebuild, which macOS sees as a new app.
+            if FileManager.default.fileExists(atPath: Storage.calibrationURL.path) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                    if self?.hasAccess == false { self?.explainAccess() }
+                }
+            }
+        }
+        // Access can be granted, or revoked, while running.
+        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.checkAccess() }
+    }
+
+    private func checkAccess() {
+        let granted = AXIsProcessTrusted()
+        guard granted != hasAccess else { return }
+        hasAccess = granted
+        Feedback.log("Accessibility access turned \(granted ? "on" : "off").")
+        showAccessState()
+        if granted && !started {
+            startUp()
+        } else if !granted {
+            switcher?.stop()
+        }
+    }
+
+    private func showAccessState() {
+        NSApp.dockTile.badgeLabel = hasAccess ? nil : "!"
+    }
+
+    @objc private func explainAccess() {
+        let response = alert("Turn on Accessibility access", """
+        gaze-switch needs it to switch windows and to scroll. Without it, macOS quietly ignores both.
+
+        Open System Settings → Privacy & Security → Accessibility and turn on gaze-switch.
+
+        If gaze-switch is already listed and turned on, that entry is for an older build: select it, click −, then open gaze-switch again and allow it.
+        """, buttons: ["Open System Settings", "Later"])
+        if response == .alertFirstButtonReturn { Permissions.openAccessibilitySettings() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -33,8 +79,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuItemValidation
     }
 
     private func startUp() {
+        started = true
+        // A calibration started from the menu will start switching when it finishes.
+        guard calibration == nil else { return }
         guard let model = loadModel() else {
-            alert("Let's calibrate", "Dots will appear on each screen. Look at each one until it disappears, turning your head the way you normally would.")
+            let outdated = FileManager.default.fileExists(atPath: Storage.calibrationURL.path)
+            alert(outdated ? "Tracking has improved" : "Let's calibrate",
+                  (outdated ? "Calibrate again to use it. " : "") +
+                  "Dots will appear on each screen. Look at each one until it disappears, turning your head the way you normally would.")
             return calibrate()
         }
         if !Displays.match(model.displays),
@@ -46,7 +98,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuItemValidation
 
     private func handle(_ frame: FrameResult) {
         guard !paused else { return }
-        if let calibration { calibration.handle(frame) } else { switcher?.handle(frame) }
+        if let calibration { return calibration.handle(frame) }
+        if hasAccess { switcher?.handle(frame) }
+        tutorial?.update(frame: frame, switcher: switcher, hasAccess: hasAccess)
     }
 
     private func startSwitching(_ model: GazeModel) {
@@ -72,6 +126,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuItemValidation
         case .saved(let model, let summary):
             alert("Calibration saved", summary)
             startSwitching(model)
+            if !UserDefaults.standard.bool(forKey: "tutorialShown") {
+                UserDefaults.standard.set(true, forKey: "tutorialShown")
+                showTutorial()
+            }
         case .failed:
             if alert("Couldn't calibrate", "Make sure the camera can see your face, then try again.", buttons: ["Try Again", "Quit"]) == .alertFirstButtonReturn {
                 calibrate()
@@ -96,9 +154,23 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuItemValidation
 
     @objc private func setScrollMode(_ sender: NSMenuItem) {
         guard let mode = (sender.representedObject as? String).flatMap(ScrollMode.init(rawValue:)) else { return }
+        apply(mode)
+    }
+
+    private func apply(_ mode: ScrollMode) {
         config.scrollMode = mode
         switcher?.scrollMode = mode
+        tutorial?.model.scrollMode = mode
         saveConfig()
+    }
+
+    @objc private func showTutorial() {
+        if tutorial == nil {
+            let tutorial = TutorialWindowController(config: config)
+            tutorial.model.onScrollModeChange = { [weak self] in self?.apply($0) }
+            self.tutorial = tutorial
+        }
+        tutorial?.show()
     }
 
     @objc private func openSettings() {
@@ -111,6 +183,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuItemValidation
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         switch item.action {
+        case #selector(explainAccess):
+            item.isHidden = hasAccess
         case #selector(toggle):
             item.title = switcher?.enabled == true ? "Turn Off  (\(config.hotkey))" : "Turn On  (\(config.hotkey))"
             return switcher != nil && calibration == nil
@@ -152,10 +226,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuItemValidation
         scrollItem.submenu = scrollMenu
 
         let items = [
+            NSMenuItem(title: "⚠️ Turn On Accessibility Access…", action: #selector(explainAccess), keyEquivalent: ""),
             NSMenuItem(title: "Turn Off", action: #selector(toggle), keyEquivalent: ""),
             NSMenuItem(title: "Show Gaze Dot", action: #selector(toggleGazeDot), keyEquivalent: ""),
             scrollItem,
             .separator(),
+            NSMenuItem(title: "How to Scroll…", action: #selector(showTutorial), keyEquivalent: ""),
             NSMenuItem(title: "Calibrate…", action: #selector(calibrate), keyEquivalent: ""),
             NSMenuItem(title: "Open Settings File", action: #selector(openSettings), keyEquivalent: ""),
         ]

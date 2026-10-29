@@ -39,7 +39,10 @@ enum Displays {
 private func _AXUIElementGetWindow(_ element: AXUIElement, _ id: UnsafeMutablePointer<CGWindowID>) -> AXError
 
 enum Windows {
-    /// Normal app windows on screen, front to back. Our own windows are left out.
+    /// Our own windows that gaze can activate and scroll, so you can practice on the tutorial.
+    static var ownTargets: Set<UInt32> = []
+
+    /// Normal app windows on screen, front to back. Of our own windows, only `ownTargets` count.
     static func onScreen() -> [WindowInfo] {
         let me = getpid()
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
@@ -48,7 +51,8 @@ enum Windows {
         return list.compactMap { d in
             guard (d[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
                   let id = (d[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
-                  let pid = (d[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value, pid != me,
+                  let pid = (d[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                  pid != me || ownTargets.contains(id),
                   let bounds = d[kCGWindowBounds as String] as? NSDictionary,
                   let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary),
                   frame.width >= 80, frame.height >= 60,
@@ -62,6 +66,7 @@ enum Windows {
     }
 
     static func isFocused(_ window: WindowInfo) -> Bool {
+        if window.pid == getpid() { return NSApp.isActive && NSApp.keyWindow?.windowNumber == Int(window.id) }
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == window.pid,
               let focused = attribute(application(window.pid), kAXFocusedWindowAttribute) else { return false }
         return windowID(of: focused as! AXUIElement) == window.id
@@ -70,6 +75,13 @@ enum Windows {
     /// Brings the window's app to the front and raises the window. Needs Accessibility permission.
     @discardableResult
     static func activate(_ window: WindowInfo) -> Bool {
+        // Accessibility calls into our own process would wait on the main thread we're running on.
+        if window.pid == getpid() {
+            guard let own = NSApp.windows.first(where: { $0.windowNumber == Int(window.id) }) else { return false }
+            NSApp.activate(ignoringOtherApps: true)
+            own.makeKeyAndOrderFront(nil)
+            return true
+        }
         let app = application(window.pid)
         NSRunningApplication(processIdentifier: window.pid)?.activate(options: [])
         AXUIElementSetAttributeValue(app, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
@@ -182,6 +194,16 @@ final class Scroller {
 }
 
 enum Permissions {
+    /// Shows macOS's own prompt, which also adds the app to the Accessibility list.
+    static func requestAccessibility() {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+    }
+
+    static func openAccessibilitySettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+    }
+
     /// Asks macOS to show the Accessibility prompt if needed, then waits until access is granted.
     static func waitForAccessibility(then done: @escaping () -> Void) {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
